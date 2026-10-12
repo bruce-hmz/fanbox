@@ -54,7 +54,13 @@ function writeHookFiles() {
     const hooks = {};
     for (const ev of ['SessionStart', 'UserPromptSubmit', 'PreToolUse', 'Notification', 'Stop', 'SubagentStop', 'SessionEnd']) hooks[ev] = on('*');
     hooks.PostToolUse = on('Edit|Write|MultiEdit|NotebookEdit|Bash');
-    fs.writeFileSync(path.join(dir, 'claude-settings.json'), JSON.stringify({ hooks }, null, 2) + '\n');
+    fs.copyFileSync(path.join(__dirname, '..', 'lib', 'claude-statusline.cjs'), path.join(dir, 'claude-statusline.cjs'));
+    const quote = (s) => "'" + s.replace(/'/g, "'\\''") + "'";
+    const command = process.platform === 'win32'
+      ? `set ELECTRON_RUN_AS_NODE=1&&"${process.execPath}" "${path.join(dir, 'claude-statusline.cjs')}"`
+      : `ELECTRON_RUN_AS_NODE=1 ${quote(process.execPath)} ${quote(path.join(dir, 'claude-statusline.cjs'))}`;
+    const statusLine = { type: 'command', command };
+    fs.writeFileSync(path.join(dir, 'claude-settings.json'), JSON.stringify({ hooks, statusLine }, null, 2) + '\n');
     // codex 的 notify 是整个数组覆盖：用户 ~/.codex/config.toml 里原有的通知程序（如 Codex Computer Use）
     // 会被顶掉，所以脚本末尾接力调用它、原参数照传
     const orig = codexUserNotify();
@@ -282,20 +288,25 @@ function cmpVer(a, b) {
   return 0;
 }
 const REL_PAGE = 'https://github.com/alchaincyf/fanbox/releases/latest';
+let latestReleaseError = '';
 async function fetchLatestRelease() {
+  latestReleaseError = '';
   // 先走 API（信息全）；代理共享出口 IP 很容易吃 GitHub API 的未认证限流（60 次/小时/IP，403），
   // 失败就退回抓 releases/latest 网页重定向——重定向后的 URL 自带 tag，且不占 API 配额
   try {
     const res = await net.fetch('https://api.github.com/repos/alchaincyf/fanbox/releases/latest', {
       headers: { 'User-Agent': 'fanbox-app', Accept: 'application/vnd.github+json' },
+      signal: AbortSignal.timeout(12000),
     });
     if (res.ok) {
       const rel = await res.json();
       // 顺带带上资产清单（网页兜底那条路拿不到，那时为 null 表示「不知道」）
       if (rel.tag_name) return { tag: rel.tag_name, url: rel.html_url || REL_PAGE, assets: (rel.assets || []).map((a) => a.name) };
     }
-  } catch { /* 走兜底 */ }
-  const res = await net.fetch(REL_PAGE, { headers: { 'User-Agent': 'fanbox-app' } });
+    latestReleaseError = (res.status === 429 || (res.status === 403 && res.headers.get('x-ratelimit-remaining') === '0')) ? `GitHub API限流（HTTP ${res.status}）` : `GitHub API HTTP ${res.status}`;
+  } catch { latestReleaseError = 'GitHub API网络连接失败或超时'; }
+  const res = await net.fetch(REL_PAGE, { headers: { 'User-Agent': 'fanbox-app' }, signal: AbortSignal.timeout(12000) });
+  if (!res.ok) { latestReleaseError += `；发布页HTTP ${res.status}`; return null; }
   const m = String(res.url || '').match(/\/releases\/tag\/([^/?#]+)/);
   if (m) return { tag: decodeURIComponent(m[1]), url: res.url, assets: null };
   return null;
@@ -311,10 +322,11 @@ async function checkUpdate(opts) {
   try { info = await fetchLatestRelease(); } catch { info = null; }
   if (!info) {
     if (manual) {
-      dialog.showMessageBoxSync(win && !win.isDestroyed() ? win : undefined, {
-        type: 'warning', buttons: [M('好', 'OK')], message: M('检查更新失败', 'Update check failed'),
-        detail: M('没连上 GitHub（网络问题或接口限流），稍后再试。', 'Could not reach GitHub (network issue or rate limit). Try again later.'),
+      const choice = dialog.showMessageBoxSync(win && !win.isDestroyed() ? win : undefined, {
+        type: 'warning', buttons: [M('打开下载页', 'Open download page'), M('关闭', 'Close')], defaultId: 0, cancelId: 1, message: M('检查更新失败', 'Update check failed'),
+        detail: `${latestReleaseError || M('网络连接失败或超时', 'Network connection failed or timed out')}\n${REL_PAGE}`,
       });
+      if (choice === 0) shell.openExternal(REL_PAGE);
     } else if (updRetry < 3) { updRetry++; setTimeout(checkUpdate, 10 * 60 * 1000); } // 失败别干等 12 小时
     return;
   }
@@ -1404,36 +1416,18 @@ function watchNoisy(filename) {
   return !name || name.endsWith('~') || name.endsWith('.swp')
     || /\.(tmp|part|crdownload|lock)(\.|$)|-(journal|shm|wal)$/i.test(name);
 }
-// 事件不再一条一条跨 IPC：进 100ms 窗口合并，stat 过滤也在窗口结算时异步做，
-// 然后一条 fs:changed-batch 带整批过去（preload 展开成单条回调，渲染层无感）
-let watchPending = [];
-let watchTimer = null;
-async function flushWatch() {
-  watchTimer = null;
-  const batch = watchPending;
-  watchPending = [];
-  // FSEvents 连「文件只是被读了一下」（atime/元数据更新）都报：agent cat/Read 个文件、
-  // Spotlight 扫一遍都会触发。mtime/ctime 都不新鲜 = 内容根本没动过，丢弃；
-  // stat 失败 = 刚被删，是真变更，照常转发
-  const now = Date.now();
-  const keep = await Promise.all(batch.map(async (m) => {
-    if (!m.filename) return m;
-    try {
-      const st = await fs.promises.stat(path.join(m.dir, m.filename));
-      if (now - st.mtimeMs > 3000 && now - st.ctimeMs > 3000) return null;
-    } catch { /* 已删除/无权限：当真变更转发 */ }
-    return m;
-  }));
-  const out = keep.filter(Boolean);
-  if (out.length && win && !win.isDestroyed()) win.webContents.send('fs:changed-batch', out);
-  // 被监听的目录自己被删/改名了：FSEvents 只会报几条事件，watcher 不会自己关，从前就永远留在表里
-  // （watch-set 见表里有就跳过，目录回来了也不会重新挂）。这里顺着这批事件的目录查一遍，没了就摘掉
+// 去重、有界队列、最多16个并行stat；上批完成才调度下一批。
+const { createWatchBatcher } = require('../lib/watch-batcher');
+const watchBatcher = createWatchBatcher((batch) => {
+  if (win && !win.isDestroyed()) win.webContents.send('fs:changed-batch', batch);
   for (const dir of new Set(batch.map((m) => m.dir))) {
-    if (fs.existsSync(dir)) continue;
-    const w = watchers.get(dir);
-    if (w) { try { w.close(); } catch { /* */ } watchers.delete(dir); }
+    fs.promises.stat(dir).catch((e) => {
+      if (e.code !== 'ENOENT') return;
+      const w = watchers.get(dir);
+      if (w) { try { w.close(); } catch { /* */ } watchers.delete(dir); }
+    });
   }
-}
+});
 function startWatch(dir) {
   if (watchers.has(dir) || !dir || !fs.existsSync(dir)) return;
   try {
@@ -1443,8 +1437,7 @@ function startWatch(dir) {
       if (!win || win.isDestroyed()) return;
       const name = filename ? filename.toString() : null;
       if (name && watchNoisy(name)) return;
-      watchPending.push({ dir, filename: name });
-      if (!watchTimer) watchTimer = setTimeout(flushWatch, 100);
+      watchBatcher.enqueue({ dir, filename: name });
     });
     // FSWatcher 是 EventEmitter：EMFILE（fd 用光）这类错误异步走 'error' 事件，没人听就是主进程未捕获异常，
     // 整个 app 跟着崩。听到就把这只关掉、从表里摘除，下次 watch-set 会重试

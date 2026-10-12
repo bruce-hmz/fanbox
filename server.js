@@ -1901,71 +1901,28 @@ function readBody(req) {
 // 不依赖两个 CLI 在跑：直接读它们落在本机的会话日志。
 // Claude Code：~/.claude/projects/**/*.jsonl 里每条 assistant 消息带 usage（token 明细）→ 增量解析聚合
 // Codex：~/.codex/sessions/**/rollout-*.jsonl 的 token_count 事件带 rate_limits（5h 窗口/周配额百分比，官方数）→ tail 取最新快照
-const CLAUDE_PROJ = path.join(HOME, '.claude', 'projects');
-const CODEX_SESS = path.join(HOME, '.codex', 'sessions');
-const claudeFileCache = new Map(); // file -> { offset, lastMsgId, events: [{t, in, out, cc, cr}] }
+const CLAUDE_PROJ = path.join(process.env.CLAUDE_CONFIG_DIR || path.join(HOME, '.claude'), 'projects');
+const CODEX_SESS = path.join(process.env.CODEX_HOME || path.join(HOME, '.codex'), 'sessions');
 let usageResultCache = { at: 0, data: null };
-
-async function parseClaudeFile(file, stat) {
-  let c = claudeFileCache.get(file);
-  if (!c) { c = { offset: 0, lastMsgId: '', events: [] }; claudeFileCache.set(file, c); }
-  if (stat.size < c.offset) { c.offset = 0; c.lastMsgId = ''; c.events = []; } // 文件被截断重写：重来
-  if (stat.size === c.offset) return c.events;
-  const fh = await fsp.open(file, 'r');
-  let chunk;
-  try {
-    const len = stat.size - c.offset;
-    const buf = Buffer.alloc(len);
-    await fh.read(buf, 0, len, c.offset);
-    chunk = buf.toString('utf8');
-  } finally { await fh.close(); }
-  // 末尾可能是写到一半的行：留给下一轮，offset 只推进到最后一个完整换行
-  const lastNL = chunk.lastIndexOf('\n');
-  if (lastNL === -1) return c.events;
-  c.offset += Buffer.byteLength(chunk.slice(0, lastNL + 1), 'utf8');
-  for (const line of chunk.slice(0, lastNL).split('\n')) {
-    if (!line.includes('"usage"') || !line.includes('"assistant"')) continue;
-    let d; try { d = JSON.parse(line); } catch { continue; }
-    const m = d && d.message;
-    const u = m && m.usage;
-    if (!u || d.type !== 'assistant') continue;
-    if (m.model === '<synthetic>') continue;
-    if (m.id && m.id === c.lastMsgId) continue; // 同一条消息分多行落盘，usage 重复：只记第一次
-    if (m.id) c.lastMsgId = m.id;
-    const t = Date.parse(d.timestamp || '') || stat.mtimeMs;
-    c.events.push({ t, in: u.input_tokens || 0, out: u.output_tokens || 0, cc: u.cache_creation_input_tokens || 0, cr: u.cache_read_input_tokens || 0 });
-  }
-  return c.events;
-}
-
-async function claudeUsage() {
-  const cutoff = Date.now() - 8 * 86400000;
-  const files = [];
-  let dirs;
-  try { dirs = await fsp.readdir(CLAUDE_PROJ); } catch { return null; } // 没装/没用过 Claude Code
-  await Promise.all(dirs.map(async (d) => {
-    let names;
-    try { names = await fsp.readdir(path.join(CLAUDE_PROJ, d)); } catch { return; }
-    await Promise.all(names.filter((n) => n.endsWith('.jsonl')).map(async (n) => {
-      const fp = path.join(CLAUDE_PROJ, d, n);
-      try { const st = await fsp.stat(fp); if (st.mtimeMs >= cutoff) files.push({ fp, st }); } catch { /* */ }
-    }));
-  }));
-  const live = new Set(files.map((f) => f.fp));
-  for (const k of claudeFileCache.keys()) { if (!live.has(k)) claudeFileCache.delete(k); } // 过期文件出缓存
-  const all = [];
-  for (const { fp, st } of files) { try { all.push(...await parseClaudeFile(fp, st)); } catch { /* 单文件坏不挡整体 */ } }
-  const now = Date.now();
-  const dayStart = new Date(); dayStart.setHours(0, 0, 0, 0);
-  const mk = () => ({ total: 0, input: 0, output: 0, cacheRead: 0, cacheCreate: 0, msgs: 0 });
-  const last5h = mk(), today = mk(), week = mk();
-  for (const e of all) {
-    const tot = e.in + e.out + e.cc + e.cr;
-    for (const [b, from] of [[last5h, now - 5 * 3600000], [today, dayStart.getTime()], [week, now - 7 * 86400000]]) {
-      if (e.t >= from) { b.total += tot; b.input += e.in; b.output += e.out; b.cacheRead += e.cr; b.cacheCreate += e.cc; b.msgs++; }
-    }
-  }
-  return { last5h, today, week };
+let usageInFlight = null;
+let tokenWorker = null;
+let tokenInFlight = null;
+let tokenResult = null;
+let tokenResultAt = 0;
+function localTokenUsage() {
+  if (tokenResult && Date.now() - tokenResultAt < 30000) return Promise.resolve(tokenResult);
+  if (tokenInFlight) return tokenInFlight;
+  tokenInFlight = new Promise((resolve, reject) => {
+    const { Worker } = require('worker_threads');
+    const worker = tokenWorker || (tokenWorker = new Worker(path.join(__dirname, 'lib', 'agent-tokens.js')));
+    const clean = () => { worker.removeListener('message', done); worker.removeListener('error', fail); worker.removeListener('exit', exited); worker.unref(); };
+    const done = (data) => { clean(); if (data.error) return reject(new Error('统计失败')); tokenResult = data; tokenResultAt = Date.now(); usageResultCache.at = 0; resolve(data); };
+    const fail = () => { clean(); tokenWorker = null; reject(new Error('统计失败')); };
+    const exited = () => { tokenWorker = null; fail(); };
+    worker.ref(); worker.once('message', done); worker.once('error', fail); worker.once('exit', exited);
+    worker.postMessage({ claudeRoot: CLAUDE_PROJ, codexRoot: CODEX_SESS });
+  }).finally(() => { tokenInFlight = null; });
+  return tokenInFlight;
 }
 
 // 从最近改动的 rollout 文件尾部抓最后一条带 rate_limits 的 token_count（官方配额快照）
@@ -1985,6 +1942,7 @@ async function codexUsage() {
   await walk(CODEX_SESS, 0);
   if (!files.length) return null;
   files.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  let latest = null;
   for (const f of files.slice(0, 10)) { // 最新几个会话里找；都没有就放弃
     try {
       const fh = await fsp.open(f.fp, 'r');
@@ -2001,10 +1959,9 @@ async function codexUsage() {
         let d; try { d = JSON.parse(line); } catch { continue; }
         const pl = d && d.payload;
         const rl = pl && pl.rate_limits;
-        if (!rl || (!rl.primary && !rl.secondary)) continue;
+        if (!rl || (rl.limit_id && rl.limit_id !== 'codex') || (!rl.primary && !rl.secondary)) continue;
         const capturedAt = Date.parse(d.timestamp || '') || f.mtimeMs;
-        // 快照是「当时」的数：窗口在快照之后重置过的话，旧百分比就完全失真（比如 21 小时前
-        // 的 5h 窗口 57%），归零并标 stale——没有新会话日志就说明重置后根本没用过
+        // 过期窗口标待更新，不能把日志里没出现新请求解释成账号零消耗。
         const win = (w) => {
           if (!w) return null;
           let resetsAt = w.resets_at || 0;
@@ -2013,19 +1970,20 @@ async function codexUsage() {
           if (!end && w.resets_in_seconds != null) end = capturedAt + w.resets_in_seconds * 1000;
           if (!end && w.window_minutes) end = capturedAt + w.window_minutes * 60000;
           const stale = !!end && end < Date.now();
-          return { usedPercent: stale ? 0 : w.used_percent, windowMinutes: w.window_minutes, resetsAt: stale ? 0 : resetsAt, stale };
+          return { usedPercent: w.used_percent, windowMinutes: w.window_minutes, resetsAt: resetsAt || Math.floor(end / 1000), stale };
         };
-        return { planType: rl.plan_type || '', capturedAt, primary: win(rl.primary), secondary: win(rl.secondary) };
+        if (!latest || capturedAt > latest.capturedAt) latest = { planType: rl.plan_type || '', capturedAt, primary: win(rl.primary), secondary: win(rl.secondary) };
+        break;
       }
     } catch { /* 下一个文件 */ }
   }
-  return null;
+  return latest;
 }
 
 // Claude Code 官方限额窗口（和它 /usage 面板同源）：5h 滚动窗口 + 周配额的百分比和重置时间。
 // 本地 jsonl 只有 token 流水、推不出官方百分比，必须拿 Claude Code 自己的 OAuth token
 // （macOS 在 Keychain，其他平台落在 ~/.claude/.credentials.json）查官方 usage 接口。
-// 这是本服务唯一的出网请求，只发往 api.anthropic.com——Claude Code 平时也在发同一个请求。
+// 只调用官方额度接口，令牌不发送到第三方。
 async function claudeOAuthToken() {
   const pick = (raw) => {
     const o = JSON.parse(raw).claudeAiOauth;
@@ -2041,7 +1999,7 @@ async function claudeOAuthToken() {
       if (t) return t;
     } catch { /* 落到凭证文件 */ }
   }
-  try { return pick(await fsp.readFile(path.join(HOME, '.claude', '.credentials.json'), 'utf8')); }
+  try { return pick(await fsp.readFile(path.join(process.env.CLAUDE_CONFIG_DIR || path.join(HOME, '.claude'), '.credentials.json'), 'utf8')); }
   catch { return null; }
 }
 
@@ -2062,24 +2020,79 @@ async function curlSysProxyLine() {
   return '';
 }
 
-async function claudeOfficialLimits() {
-  const token = await claudeOAuthToken();
-  if (!token) return null;
-  // 不用 Node https：该接口的防护按 TLS 指纹拦——同样的请求头 curl 能 200、Node 直接 403。
-  // 走系统 curl（macOS/Win10+ 自带），顺带继承用户的代理环境变量；
-  // token 经 stdin 的 curl 配置传入，不暴露在进程列表里
+// 凭证只经 stdin 传 curl，不进入 argv、日志或接口返回。失败保留上次成功值。
+async function usageRequest(url, token, extraHeader = '') {
   const proxyLine = await curlSysProxyLine();
-  const body = await new Promise((resolve, reject) => {
-    const cp = execFile('curl', ['-sS', '--max-time', '8', '-K', '-', 'https://api.anthropic.com/api/oauth/usage'],
-      { timeout: 10000 }, (err, stdout) => (err ? reject(err) : resolve(stdout)));
-    cp.stdin.end(`${proxyLine}header = "Authorization: Bearer ${token}"\nheader = "anthropic-beta: oauth-2025-04-20"\n`);
+  const out = await new Promise((resolve, reject) => {
+    const cp = execFile('curl', ['-sS', '--connect-timeout', '5', '--max-time', '12', '-w', '\n%{http_code}', '-K', '-', url],
+      { timeout: 14000, maxBuffer: 1024 * 1024 }, (err, stdout) => err ? reject(new Error('网络连接失败或超时')) : resolve(stdout));
+    cp.stdin.on('error', () => {});
+    cp.stdin.end(`${proxyLine}header = "Authorization: Bearer ${token}"\n${extraHeader}`);
   });
-  const d = JSON.parse(body);
-  const win = (w) => (w && w.utilization != null)
-    ? { usedPercent: w.utilization, resetsAt: w.resets_at ? Math.floor(Date.parse(w.resets_at) / 1000) : 0 }
-    : null;
-  const fiveHour = win(d.five_hour), sevenDay = win(d.seven_day);
-  return (fiveHour || sevenDay) ? { fiveHour, sevenDay } : null;
+  const cut = out.lastIndexOf('\n'), status = Number(out.slice(cut + 1));
+  if (status !== 200) throw new Error(status === 401 ? '登录凭证已过期，请在CLI重新登录' : status === 429 ? '请求过于频繁，稍后自动重试' : `额度接口HTTP ${status}`);
+  try { return JSON.parse(out.slice(0, cut)); } catch { throw new Error('额度接口返回格式异常'); }
+}
+const officialCache = new Map();
+let claudeLiveLimits = null;
+function acceptClaudeLimits(data) {
+  const valid = (w) => w && Number.isFinite(w.usedPercent) && w.usedPercent >= 0 && Number.isFinite(w.resetsAt) && w.resetsAt > Date.now() / 1000;
+  const fiveHour = valid(data.fiveHour) ? data.fiveHour : null, sevenDay = valid(data.sevenDay) ? data.sevenDay : null;
+  if (!fiveHour && !sevenDay) return { ok: false };
+  const pick = (w) => w ? { usedPercent: w.usedPercent, resetsAt: w.resetsAt } : null;
+  claudeLiveLimits = { fiveHour: pick(fiveHour), sevenDay: pick(sevenDay), capturedAt: Date.now(), source: 'statusline', stale: false };
+  usageResultCache.at = 0;
+  return { ok: true };
+}
+async function cachedOfficial(agent, fetcher) {
+  let c = officialCache.get(agent);
+  if (!c) { c = { next: 0, data: null, failures: 0 }; officialCache.set(agent, c); }
+  if (Date.now() < c.next) return c.data;
+  if (c.pending) return c.pending;
+  c.pending = (async () => {
+    try {
+      const data = await fetcher();
+      c.failures = 0; c.next = Date.now() + 60000;
+      c.data = { ...data, capturedAt: Date.now(), stale: false, error: null };
+    } catch (e) {
+      c.failures++; c.next = Date.now() + Math.min(600000, 30000 * 2 ** (c.failures - 1));
+      c.data = { ...(c.data || {}), stale: true, error: e.message };
+    }
+    return c.data;
+  })().finally(() => { c.pending = null; });
+  return c.pending;
+}
+async function claudeOfficialLimits() {
+  if (claudeLiveLimits && Date.now() - claudeLiveLimits.capturedAt < 120000) return claudeLiveLimits;
+  const official = await cachedOfficial('claude', async () => {
+    const token = await claudeOAuthToken();
+    if (!token) throw new Error('未找到有效登录凭证，请在Claude Code重新登录');
+    const d = await usageRequest('https://api.anthropic.com/api/oauth/usage', token, 'header = "anthropic-beta: oauth-2025-04-20"\n');
+    const win = (w) => w && Number.isFinite(w.utilization)
+      ? { usedPercent: w.utilization, resetsAt: Date.parse(w.resets_at || '') / 1000 || 0 } : null;
+    const fiveHour = win(d.five_hour), sevenDay = win(d.seven_day);
+    if (!fiveHour && !sevenDay) throw new Error('额度接口没有返回可识别的窗口');
+    return { fiveHour, sevenDay };
+  });
+  if (official.error && claudeLiveLimits && (!official.capturedAt || claudeLiveLimits.capturedAt > official.capturedAt)) return { ...claudeLiveLimits, stale: true, error: official.error };
+  return official;
+}
+async function codexOfficialLimits() {
+  return cachedOfficial('codex', async () => {
+    let auth;
+    try { auth = JSON.parse(await fsp.readFile(path.join(process.env.CODEX_HOME || path.join(HOME, '.codex'), 'auth.json'), 'utf8')); } catch { /* */ }
+    const token = auth?.tokens?.access_token;
+    if (!token) throw new Error('未找到Codex登录凭证，使用本地快照');
+    const account = auth.tokens.account_id;
+    const d = await usageRequest('https://chatgpt.com/backend-api/wham/usage', token,
+      account && /^[a-zA-Z0-9-]+$/.test(account) ? `header = "ChatGPT-Account-Id: ${account}"\n` : '');
+    const win = (w) => w && Number.isFinite(w.used_percent) ? { usedPercent: w.used_percent, windowMinutes: w.limit_window_seconds / 60, resetsAt: w.reset_at || 0 } : null;
+    const primary = win(d.rate_limit?.primary_window), secondary = win(d.rate_limit?.secondary_window);
+    if (!primary && !secondary) throw new Error('额度接口没有返回可识别的窗口');
+    const r = d.rate_limit_reset_credits;
+    const resets = r && Number.isInteger(r.available_count) ? { available: r.available_count, applicable: Number.isInteger(r.applicable_available_count) ? r.applicable_available_count : null } : null;
+    return { planType: d.plan_type || '', primary, secondary, resets, source: 'official' };
+  });
 }
 
 // ---------- Agent 项目（最近被 coding agent 处理过的项目文件夹）----------
@@ -2512,16 +2525,22 @@ async function builtinSkillInstall(id) {
 }
 
 async function agentUsage() {
-  if (usageResultCache.data && Date.now() - usageResultCache.at < 30000) return usageResultCache.data;
-  const [claude, codex, claudeLimits] = await Promise.all([
-    claudeUsage().catch(() => null),
-    codexUsage().catch(() => null),
-    claudeOfficialLimits().catch(() => null),
-  ]);
-  const claudeOut = (claude || claudeLimits) ? { ...(claude || {}), official: claudeLimits } : null;
-  const data = { ok: true, at: Date.now(), claude: claudeOut, codex };
-  usageResultCache = { at: Date.now(), data };
-  return data;
+  if (usageResultCache.data && Date.now() - usageResultCache.at < (usageResultCache.data.tokensPending ? 3000 : 30000)) return usageResultCache.data;
+  if (usageInFlight) return usageInFlight;
+  usageInFlight = (async () => {
+    // 首次大日志扫描不挡住官方额度；结果完成后让下一次轮询立即取到。
+    localTokenUsage().catch(() => {});
+    const [snapshot, claudeLimits, codexLimits] = await Promise.all([
+      codexUsage().catch(() => null),
+      claudeOfficialLimits(), codexOfficialLimits(),
+    ]);
+    const codex = codexLimits.primary || codexLimits.secondary ? codexLimits : { ...(snapshot || {}), error: codexLimits.error, source: 'snapshot' };
+    const tokens = tokenResult;
+    const data = { ok: true, at: Date.now(), tokensPending: !!tokenInFlight, claude: { ...(tokens?.claude || {}), official: claudeLimits }, codex: { ...codex, ...(tokens?.codex || {}) } };
+    usageResultCache = { at: Date.now(), data };
+    return data;
+  })().finally(() => { usageInFlight = null; });
+  return usageInFlight;
 }
 
 // ---------- 路由 ----------
@@ -3032,6 +3051,7 @@ const server = http.createServer(async (req, res) => {
       if (p === '/api/agent/wait' && req.method === 'POST') { const b = await readBody(req); return sendJSON(res, 200, await A.wait(b.id, b)); }
       if (p === '/api/agent/kill' && req.method === 'POST') { const b = await readBody(req); return sendJSON(res, 200, await A.kill(b.id)); }
       // agent 官方 hook 事件：body 是 claude hook / codex notify 的 JSON 原样，终端 id 走 x-fanbox-term 头（hook 命令里 $FANBOX_TERM_ID 展开）
+      if (p === '/api/agent/usage' && req.method === 'POST') return sendJSON(res, 200, acceptClaudeLimits(await readBody(req)));
       if (p === '/api/agent/event' && req.method === 'POST') { const b = await readBody(req); return sendJSON(res, 200, await A.event(String(req.headers['x-fanbox-term'] || ''), b)); }
       return sendJSON(res, 404, { ok: false, error: 'unknown agent endpoint' });
     }

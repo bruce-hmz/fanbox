@@ -1,12 +1,13 @@
 {
   "name": "fanbox",
-  "version": "2.16.1",
+  "version": "2.17.0",
   "description": "FanBox — the cockpit for coding agents. Command Claude Code or Codex, watch every file and line they change, and take over anytime.",
   "bin": {
     "fanbox": "server.js"
   },
   "main": "electron/main.js",
   "scripts": {
+    "test": "node --test tests/*.test.js",
     "start": "node server.js",
     "app": "electron .",
     "rebuild": "electron-rebuild -f -w node-pty",
@@ -30,6 +31,8 @@
       "!_archive{,/**/*}",
       "!design-demos{,/**/*}",
       "!experiments{,/**/*}",
+      "!tests{,/**/*}",
+      "!发布{,/**/*}",
       "!docs{,/**/*}",
       "!素材{,/**/*}",
       "!assets{,/**/*}",

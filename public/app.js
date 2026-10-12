@@ -1419,8 +1419,9 @@ async function toggleFav(e) {
 // 重拉当前目录但保留筛选词，操作后刷新视图
 async function refresh() {
   if (!state.cwd || state.recentMode) return;
-  const data = await api('/api/list?path=' + encodeURIComponent(state.cwd));
-  if (data.error) return;
+  const cwd = state.cwd;
+  const data = await api('/api/list?path=' + encodeURIComponent(cwd));
+  if (data.error || state.cwd !== cwd || state.recentMode) return;
   state.entries = data.entries;
   state.project = data.project;
   state.breadcrumb = data.breadcrumb;
@@ -4663,48 +4664,85 @@ const usagePanel = {
       <span class="usage-num${danger}">${v}%</span></div>
       ${extra ? `<div class="usage-sub">${extra}</div>` : ''}`;
   },
+  windowLabel(w) {
+    const m = w.windowMinutes;
+    return m === 10080 ? '周额度' : m === 300 ? '5h窗口' : m >= 1440 ? `${Math.round(m / 1440)}天窗口` : m ? `${m / 60}h窗口` : '额度窗口';
+  },
+  limit(label, w, stale) {
+    if (!w) return '';
+    const expired = w.stale || (w.resetsAt && w.resetsAt * 1000 < Date.now());
+    if (expired) return `<div class="usage-sub">${label}：待更新（旧窗口已结束）</div>`;
+    return this.bar(label, w.usedPercent, this.fmtReset(w.resetsAt) + (stale ? ' · 上次成功值' : ''));
+  },
+  tokens(c, agent) {
+    if (!c.today) return `<div class="usage-sub">${this.tokensPending ? '正在统计本地token…' : '本地token统计暂不可用'}</div>`;
+    const periods = [['last5h', '近5h'], ['today', '今日'], ['week', '近7天']];
+    return `<details class="usage-detail" data-agent="${agent}" ${this.expanded?.has(agent) ? 'open' : ''}>
+      <summary>token明细与缓存命中率</summary>
+      <div class="usage-sub">仅本机会话日志（含子agent），非账号账单${c.partial ? ' · 部分文件读取失败' : ''}</div>
+      ${periods.map(([key, label]) => {
+        const b = c[key], input = b.input + b.cacheRead + b.cacheCreate;
+        const rate = input ? (b.cacheRead / input * 100).toFixed(1) + '%' : '—';
+        return `<div class="usage-breakdown"><b>${label} · ${this.fmtTok(b.total)} token</b>
+          <div><span>输入缓存命中率</span><strong>${rate}</strong></div>
+          ${[['未缓存输入', b.input], ['缓存读取', b.cacheRead], ['缓存写入', b.cacheCreate], ['输出', b.output], ['其中推理', b.reasoning]].map(([name, value]) => `<div><span>${name}</span><span title="${name === '其中推理' && b.reasoningAvailable === false ? '日志未提供' : Number(value || 0).toLocaleString()}">${name === '其中推理' && b.reasoningAvailable === false ? '未提供' : (name === '其中推理' && b.reasoningPartial ? '已记录 ' : '') + this.fmtTok(value || 0)}</span></div>`).join('')}</div>`;
+      }).join('')}
+      <div class="usage-sub">命中率＝缓存读取÷全部输入。推理包含在输出内，不重复相加。复用稳定的上下文前缀、避免反复粘贴大段内容，有助于利用缓存；具体额度消耗以官方为准。</div>
+    </details>`;
+  },
   render(d) {
     const box = $('#usage-body');
-    if (!d || !d.ok) { box.innerHTML = '<div class="usage-sub">读取失败</div>'; return; }
+    if (!d || !d.ok) {
+      if (!box.querySelector('.usage-agent')) box.innerHTML = '<div class="usage-sub">读取失败，稍后重试</div>';
+      else if (!box.querySelector('.usage-fetch-error')) box.insertAdjacentHTML('afterbegin', '<div class="usage-sub usage-fetch-error">刷新失败，保留上次数据</div>');
+      return;
+    }
+    this.tokensPending = d.tokensPending;
     let h = '';
     if (d.codex) {
       const c = d.codex;
       h += `<div class="usage-agent">Codex${c.planType ? ` <i class="usage-plan">${escapeHtml(c.planType)}</i>` : ''}</div>`;
-      if (c.primary) h += this.bar('5h 窗口', c.primary.usedPercent, c.primary.stale ? '窗口已重置，跑一次 Codex 才有新数' : '');
-      if (c.secondary) h += this.bar('周配额', c.secondary.usedPercent, c.secondary.stale ? '窗口已重置，跑一次 Codex 才有新数' : this.fmtReset(c.secondary.resetsAt));
-      h += `<div class="usage-sub">快照：${this.ago(c.capturedAt)}的 Codex 会话</div>`;
+      for (const w of [c.primary, c.secondary]) if (w) h += this.limit(this.windowLabel(w), w, c.stale);
+      if (c.capturedAt) h += `<div class="usage-sub">${c.source === 'official' ? '官方数据' : '会话快照'} · ${this.ago(c.capturedAt)}</div>`;
+      if (c.error) h += `<div class="usage-sub">${escapeHtml(c.error)}</div>`;
+      if (c.resets) h += `<div class="usage-sub">重置卡：${c.resets.available}张${c.resets.applicable == null ? '' : ` · 当前适用${c.resets.applicable}张`}${c.stale ? '（上次成功值）' : ''}<br>失效时间、使用记录：接口未提供</div>`;
+      else h += '<div class="usage-sub">重置卡信息暂不可用</div>';
+      h += this.tokens(c, 'codex');
     }
     if (d.claude) {
-      const c = d.claude;
-      h += `<div class="usage-agent">Claude Code</div>`;
-      if (c.official) {
-        // 官方限额窗口（和 Claude Code /usage 面板同源）：5h 滚动窗口 + 周配额，优先展示
-        if (c.official.fiveHour) h += this.bar('5h 窗口', c.official.fiveHour.usedPercent, this.fmtReset(c.official.fiveHour.resetsAt));
-        if (c.official.sevenDay) h += this.bar('周配额', c.official.sevenDay.usedPercent, this.fmtReset(c.official.sevenDay.resetsAt));
+      const c = d.claude, o = c.official;
+      h += '<div class="usage-agent">Claude Code</div>';
+      if (o) {
+        h += this.limit('5h窗口', o.fiveHour, o.stale) + this.limit('周额度', o.sevenDay, o.stale);
+        if (o.capturedAt) h += `<div class="usage-sub">${o.source === 'statusline' ? 'CLI实时回传' : '官方数据'} · ${this.ago(o.capturedAt)}</div>`;
+        if (o.error) h += `<div class="usage-sub">${escapeHtml(o.error)}</div>`;
       }
-      if (c.last5h) {
-        // 本地 token 统计照常保留（拿不到官方数据时就只剩这块）
-        h += `<div class="usage-trio">
-          <span><b>${this.fmtTok(c.last5h.total)}</b>近5h</span>
-          <span><b>${this.fmtTok(c.today.total)}</b>今日</span>
-          <span><b>${this.fmtTok(c.week.total)}</b>本周</span>
-        </div>
-        <div class="usage-sub">token 总量 · 本地会话日志统计</div>`;
-      }
+      if (c.last5h) h += `<div class="usage-trio"><span><b>${this.fmtTok(c.last5h.total)}</b>近5h</span><span><b>${this.fmtTok(c.today.total)}</b>今日</span><span><b>${this.fmtTok(c.week.total)}</b>近7天</span></div>`;
+      h += this.tokens(c, 'claude');
     }
-    if (!d.codex && !d.claude) h = '<div class="usage-sub">没找到 Claude Code / Codex 的本机会话记录</div>';
     box.innerHTML = h;
+    this.expanded ||= new Set();
+    box.querySelectorAll('.usage-detail').forEach((el) => el.addEventListener('toggle', () => {
+      el.open ? this.expanded.add(el.dataset.agent) : this.expanded.delete(el.dataset.agent);
+    }));
   },
   async refresh() {
-    try { this.render(await api('/api/agent-usage')); }
+    if (this.loading) return;
+    this.loading = true;
+    try {
+      const d = await api('/api/agent-usage'); this.render(d);
+      clearTimeout(this.pendingTimer);
+      if (d.tokensPending && this.open()) this.pendingTimer = setTimeout(() => this.refresh(), 5000);
+    }
     catch { this.render(null); }
+    finally { this.loading = false; }
   },
   open() { return localStorage.getItem('fb_usage_open') === '1'; },
   apply() {
     const on = this.open();
     $('#usage-body').classList.toggle('hidden', !on);
     $('#usage-arrow').textContent = on ? '▾' : '▸';
-    clearInterval(this.timer); this.timer = null;
+    clearInterval(this.timer); this.timer = null; clearTimeout(this.pendingTimer);
     if (on) { this.refresh(); this.timer = setInterval(() => this.refresh(), 60000); }
   },
   bind() {
@@ -5681,7 +5719,11 @@ function igniteCard(top, count) {
   const el = area.querySelector(`[data-path="${CSS.escape(path)}"]`);
   if (!el) return; // 卡片还没渲染（新文件首次出现），等 refresh 后由 renderFiles 接管发光
   el.style.setProperty('--heat', Math.min(1, 0.4 + count * 0.12).toFixed(2));
-  el.classList.remove('live-edit'); void el.offsetWidth; el.classList.add('live-edit'); // 重新触发弹跳
+  if (Date.now() - Number(el.dataset.ignitedAt || 0) < 1200) return;
+  el.dataset.ignitedAt = Date.now();
+  el.classList.add('live-edit'); // 不强制同步布局；动画结束后才允许下一轮
+  const end = (e) => { if (e.target === el) { el.classList.remove('live-edit'); el.removeEventListener('animationend', end); } };
+  el.addEventListener('animationend', end);
   const host = el.querySelector('.icon') || el;
   const ripple = document.createElement('span');
   ripple.className = 'edit-ripple';
@@ -5704,7 +5746,25 @@ if (window.fanboxPty) {
 }
 // 文件变化 → 自动刷新列表（看着 agent 干活）；编辑中不动预览，避免吞掉未保存内容
 if (window.fanboxFs) {
-  let rt = null;
+  let rt = null, refreshing = false, refreshAgain = false;
+  const scheduleRefresh = () => {
+    refreshAgain = true;
+    if (rt || refreshing) return;
+    rt = setTimeout(async () => {
+      rt = null; refreshing = true; refreshAgain = false;
+      const cwd = state.cwd, selected = state.selected;
+      try {
+        await refresh();
+        if (cwd !== state.cwd || selected !== state.selected) return;
+        if (follow.on && follow.path && state.selected === follow.path) return;
+        if (state.selected && !$('#preview').classList.contains('hidden') && !$('#ed-host') && !imgEditState) {
+          const e = state.entries.find((x) => x.path === state.selected);
+          if (e && (e.kind === 'text' || e.kind === 'image')) await openPreview(e);
+        }
+      } catch { /* 下批变更继续刷新 */ }
+      finally { refreshing = false; if (refreshAgain) scheduleRefresh(); }
+    }, 750);
+  };
   state.changed = new Map(); // 顶层名 → { count, files:Set, ts }
   let sweep = null;
   const scheduleSweep = () => {
@@ -5748,17 +5808,9 @@ if (window.fanboxFs) {
       rec.count++; rec.ts = Date.now();
       if (rec.files.size < 8 && sub !== top) rec.files.add(sub);
       scheduleSweep();
-      igniteCard(top, rec.count); // 当场点亮这张卡（不等 250ms 刷新）
+      igniteCard(top, rec.count); // 轻量点亮，完整列表刷新独立限频
     }
-    clearTimeout(rt);
-    rt = setTimeout(async () => {
-      await refresh();
-      if (follow.on && follow.path && state.selected === follow.path) return; // 跟随有自己的实时渲染，别用 openPreview 顶掉（md 会被转进编辑器）
-      if (state.selected && !$('#preview').classList.contains('hidden') && !$('#ed-host') && !imgEditState) {
-        const e = state.entries.find((x) => x.path === state.selected);
-        if (e && (e.kind === 'text' || e.kind === 'image')) openPreview(e);
-      }
-    }, 250);
+    scheduleRefresh();
   });
 }
 

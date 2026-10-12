@@ -213,8 +213,8 @@ npm run dist         # 打包签名 .dmg（产物在 dist/，不入 git）/ buil
 
 - 后端只在本机回环地址监听 + 校验 Host 头（挡 DNS rebinding），**数据不出本机**。  
   The backend listens on loopback only and validates the Host header (anti DNS-rebinding). **Data never leaves your machine.**
-- 全部前端资源（含渲染器、字体）本地内置，**离线完全可用**。仅有的出网请求：Claude 用量接口（可选）和 GitHub 更新检查。  
-  All frontend assets (including renderers and fonts) are vendored locally — **fully usable offline**. The only outbound calls: the Claude usage API (optional) and the GitHub release check.
+- 全部前端资源（含渲染器、字体）本地内置，**离线完全可用**。用量面板会读取Claude和Codex的官方额度接口，更新检查会访问GitHub；本地token日志在本机统计。
+  All frontend assets (including renderers and fonts) are vendored locally — **fully usable offline**. The usage panel contacts the official Claude and Codex quota endpoints, and update checks contact GitHub; local token logs are processed on-device.
 - Markdown 渲染先过 DOMPurify，页面带 CSP（脚本只认本地文件、不放行内联与 eval）；所有写类接口要带每次启动随机生成、不落盘的 token，本机其他进程直接 curl 也进不来。  
   Markdown goes through DOMPurify and the page ships a CSP (local scripts only, no inline/eval); every write endpoint requires a per-launch random token that never touches disk, so other local processes can't drive it.
 - HTML 预览在隔离 origin 的沙箱 iframe 里渲染，预览不可信网页也碰不到终端能力。  

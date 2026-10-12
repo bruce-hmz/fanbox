@@ -23,3 +23,9 @@ build/*
 
 # 验证脚本的截图产物（可复跑重生成，不入库）
 experiments/bugfix-202606/shots/
+
+# 本地回归验证截图
+tests/artifacts/
+
+# 本地发布回执与核验材料
+/发布/

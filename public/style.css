@@ -1484,3 +1484,12 @@ body { transition: background-color 0.28s ease, color 0.28s ease; }
 .tr-say { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; color: var(--text-faint); }
 .tr-files { flex: none; color: var(--text-dim); }
 [data-theme="editorial"] .tr-row.active { border-left-width: 3px; }
+
+/* 用量详情沿用侧栏配色，可用键盘展开，不挤占常驻面板。 */
+.usage-detail { margin: 8px 0; color: var(--text-dim); font-size: 11px; }
+.usage-detail summary { cursor: pointer; color: var(--accent); padding: 5px 0; }
+.usage-detail summary:focus-visible { outline: 1px solid var(--accent); }
+.usage-breakdown { padding: 8px 0; border-bottom: 1px solid var(--bg-3); }
+.usage-breakdown > div { display: flex; justify-content: space-between; gap: 8px; margin-top: 5px; }
+.usage-breakdown strong { color: var(--accent); }
+.usage-sub { overflow-wrap: anywhere; }

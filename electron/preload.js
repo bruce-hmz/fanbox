@@ -28,8 +28,29 @@ contextBridge.exposeInMainWorld('fanboxRec', {
 contextBridge.exposeInMainWorld('fanboxFs', {
   watch: (dir) => ipcRenderer.invoke('fs:watch', { dir }),
   watchSet: (dirs) => ipcRenderer.invoke('fs:watch-set', { dirs }),
-  // 主进程按 100ms 窗口合批发 fs:changed-batch，这里展开成单条回调——渲染层的消费方无感
-  onChanged: (cb) => { const h = (e, list) => { for (const m of list || []) cb(m); }; ipcRenderer.on('fs:changed-batch', h); return () => ipcRenderer.removeListener('fs:changed-batch', h); },
+  // 保持分批进入渲染层，每32条让出一次事件循环，避免一批文件变更堵住键盘输入。
+  onChanged: (cb) => {
+    const pending = new Map(); let timer = null, closed = false;
+    const drain = () => {
+      timer = null;
+      let n = 0;
+      for (const [key, m] of pending) {
+        pending.delete(key); try { cb(m); } catch { /* 一条异常不阻断剩余变更 */ }
+        if (++n >= 32) break;
+      }
+      if (!closed && pending.size) timer = setTimeout(drain, 16);
+    };
+    const h = (e, list) => {
+      for (const m of list || []) {
+        const key = `${m.dir}\0${m.filename || ''}`;
+        if (pending.size < 512 || pending.has(key)) pending.set(key, m);
+        else pending.set(`${m.dir}\0`, { dir: m.dir, filename: null, overflow: true });
+      }
+      if (!timer) timer = setTimeout(drain, 0);
+    };
+    ipcRenderer.on('fs:changed-batch', h);
+    return () => { closed = true; clearTimeout(timer); pending.clear(); ipcRenderer.removeListener('fs:changed-batch', h); };
+  },
 });
 
 contextBridge.exposeInMainWorld('fanboxClipboard', {
